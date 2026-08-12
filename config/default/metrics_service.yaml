@@ -8,11 +8,25 @@ metadata:
   name: controller-manager-metrics-service
   namespace: system
 spec:
+  type: NodePort
+  # Preserves the real client source IP (no SNAT hop) - required together with
+  # the operator Deployment's nodeSelector pinning it to sre-control, the same
+  # node this NodePort's traffic must land on.
+  externalTrafficPolicy: Local
   ports:
   - name: https
     port: 8443
     protocol: TCP
     targetPort: 8443
+  # heartbeat: checkpoint-agent on the separate workload clusters posts here
+  # (CONTROLLER_URL) over the shared 192.168.28.0/24 network - needs a fixed
+  # NodePort since those clusters can't reach the mgmt-cluster's in-cluster
+  # Service DNS.
+  - name: heartbeat
+    port: 8090
+    protocol: TCP
+    targetPort: 8090
+    nodePort: 30092
   selector:
     control-plane: controller-manager
     app.kubernetes.io/name: transition-operator

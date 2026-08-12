@@ -122,10 +122,56 @@ type TransitionedPackages struct {
 	PackageTransitionMessage   string                     `json:"packageTransitionMessage,omitempty"`   // message describing the transition status
 }
 
+// ClusterPolicyPhase is the AI-assisted approval lifecycle phase for the current
+// failover recommendation/approval cycle of a ClusterPolicy. Empty string is the
+// zero value and means "no active recommendation cycle" - existing ClusterPolicy
+// objects and the fully-automatic reconciliation path are unaffected by this field.
+type ClusterPolicyPhase string
+
+const (
+	PhaseNone             ClusterPolicyPhase = ""
+	PhaseRecommended      ClusterPolicyPhase = "Recommended"
+	PhaseAwaitingApproval ClusterPolicyPhase = "AwaitingApproval"
+	PhaseApproved         ClusterPolicyPhase = "Approved"
+	PhaseRejected         ClusterPolicyPhase = "Rejected"
+	PhaseExecuting        ClusterPolicyPhase = "Executing"
+	PhaseCompleted        ClusterPolicyPhase = "Completed"
+)
+
+// FailoverRecommendation captures the AI agent's proposed failover target, written
+// by the failover-agent-mcp server's propose_failover tool and consumed/gated by
+// ClusterPolicyReconciler before it is allowed to execute a transition.
+type FailoverRecommendation struct {
+	// RecommendedTargetCluster is the cluster name the agent proposes to fail over
+	// to. Must match one of Spec.TargetClusterPolicy.PreferClusters[].Name.
+	RecommendedTargetCluster string `json:"recommendedTargetCluster,omitempty"`
+	// Reason is the agent's natural-language justification.
+	Reason string `json:"reason,omitempty"`
+	// RecommendedBy identifies the source of the recommendation, e.g. "kagent:failover-agent".
+	RecommendedBy string `json:"recommendedBy,omitempty"`
+	// FaultType is the detected fault category the controller passed to the agent.
+	FaultType string `json:"faultType,omitempty"`
+	// ApprovedBy optionally records who ran the approval patch.
+	ApprovedBy string `json:"approvedBy,omitempty"`
+	// LastPhaseTransitionTime is when Phase last changed.
+	LastPhaseTransitionTime metav1.Time `json:"lastPhaseTransitionTime,omitempty"`
+}
+
 type ClusterPolicyStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 	TransitionedPackages []TransitionedPackages `json:"transitionedPackages,omitempty"`
+
+	// Phase is the current AI-assisted approval lifecycle phase. See
+	// ClusterPolicyPhase for details. Orthogonal to TransitionedPackages.
+	// +optional
+	// +kubebuilder:validation:Enum=Recommended;AwaitingApproval;Approved;Rejected;Executing;Completed;""
+	Phase ClusterPolicyPhase `json:"phase,omitempty"`
+
+	// Recommendation holds the AI agent's proposed failover while Phase is
+	// Recommended/AwaitingApproval/Approved/Rejected.
+	// +optional
+	Recommendation *FailoverRecommendation `json:"recommendation,omitempty"`
 }
 
 // +kubebuilder:object:root=true

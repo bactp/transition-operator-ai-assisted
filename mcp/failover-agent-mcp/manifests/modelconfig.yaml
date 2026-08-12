@@ -1,0 +1,15 @@
+# ModelConfig for failover-agent (kagent.dev/v1alpha2). Reuses the existing
+# kagent-openai Secret already present in this cluster (same one backing
+# default-model-config/rca-agent-model/sre-agent-model) rather than creating a
+# new Secret/provider - no new credential to manage. Field shape verified
+# against the real default-model-config CR already running here.
+apiVersion: kagent.dev/v1alpha2
+kind: ModelConfig
+metadata:
+  name: failover-agent-model
+  namespace: kagent
+spec:
+  provider: OpenAI
+  model: gpt-5-mini
+  apiKeySecret: kagent-openai
+  apiKeySecretKey: OPENAI_API_KEY

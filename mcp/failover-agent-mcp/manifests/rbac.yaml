@@ -1,0 +1,52 @@
+# RBAC for the failover-agent-mcp ServiceAccount, referenced by
+# manifests/mcpserver.yaml (spec.deployment.serviceAccountName).
+#
+# Deliberately narrower than transition-operator's own manager-role
+# (config/rbac/role.yaml): no create/delete on clusterpolicies, no access to
+# checkpoints/status or nodehealths/status - this MCP server only needs to
+# read cluster/checkpoint state and patch ClusterPolicy.status to record an
+# AI recommendation. This is the "bounded operational tools" boundary from
+# the talk: the agent's write surface is exactly propose_failover's effect,
+# not general operator access.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: failover-agent-mcp
+  namespace: kagent
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: failover-agent-mcp-role
+rules:
+  - apiGroups: ["transition.dcnlab.ssu.ac.kr"]
+    resources: ["clusterpolicies", "checkpoints", "nodehealths"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["transition.dcnlab.ssu.ac.kr"]
+    resources: ["clusterpolicies/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    # Needed to read "<clusterName>-kubeconfig" CAPI secrets
+    # (reconcilers/capi/cluster.go) to reach into workload clusters for
+    # get_cluster_health/get_transition_candidates health checks.
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["cluster.x-k8s.io"]
+    resources: ["clusters", "machines"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: failover-agent-mcp-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: failover-agent-mcp-role
+subjects:
+  - kind: ServiceAccount
+    name: failover-agent-mcp
+    namespace: kagent

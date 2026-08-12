@@ -144,6 +144,49 @@ spec:
             type: object
           status:
             properties:
+              phase:
+                description: |-
+                  Phase is the current AI-assisted approval lifecycle phase. See
+                  ClusterPolicyPhase for details. Orthogonal to TransitionedPackages.
+                enum:
+                - Recommended
+                - AwaitingApproval
+                - Approved
+                - Rejected
+                - Executing
+                - Completed
+                - ""
+                type: string
+              recommendation:
+                description: |-
+                  Recommendation holds the AI agent's proposed failover while Phase is
+                  Recommended/AwaitingApproval/Approved/Rejected.
+                properties:
+                  approvedBy:
+                    description: ApprovedBy optionally records who ran the approval
+                      patch.
+                    type: string
+                  faultType:
+                    description: FaultType is the detected fault category the controller
+                      passed to the agent.
+                    type: string
+                  lastPhaseTransitionTime:
+                    description: LastPhaseTransitionTime is when Phase last changed.
+                    format: date-time
+                    type: string
+                  reason:
+                    description: Reason is the agent's natural-language justification.
+                    type: string
+                  recommendedBy:
+                    description: RecommendedBy identifies the source of the recommendation,
+                      e.g. "kagent:failover-agent".
+                    type: string
+                  recommendedTargetCluster:
+                    description: |-
+                      RecommendedTargetCluster is the cluster name the agent proposes to fail over
+                      to. Must match one of Spec.TargetClusterPolicy.PreferClusters[].Name.
+                    type: string
+                type: object
               transitionedPackages:
                 description: |-
                   INSERT ADDITIONAL STATUS FIELD - define observed state of cluster

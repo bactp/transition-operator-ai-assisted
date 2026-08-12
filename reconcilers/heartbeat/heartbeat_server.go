@@ -3,6 +3,7 @@ package heartbeat
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -21,16 +22,28 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
-// Payload sent by agents
+// Payload sent by agents. Field tags match the checkpoint-agent binary
+// currently in the field (vitu1/checkpoint-agent:v1.0.0), verified by
+// capturing its actual heartbeat POST body rather than trusting the
+// checkpoint-agent repo's current main branch source (which has since
+// diverged from what that published image tag was built from):
+//
+//	{"node":"","ip":"","os":"linux","arch":"amd64","cpus":16,
+//	 "cpu_usage_percent":9.52,"mem_total_bytes":33649233920,
+//	 "mem_used_bytes":5080887296,"ts":1786431411}
+//
+// Notably "node" and "ip" come through as empty strings from that binary
+// regardless of hostname/NODE_NAME/NODE_IP - see the RemoteAddr fallback in
+// the /heartbeat handler below.
 type HeartbeatPayload struct {
-	NodeName   string            `json:"node"`
-	IPAddress  string            `json:"ip"`
-	OS         string            `json:"os"`
-	Arch       string            `json:"arch"`
-	CPUCount   int               `json:"cpu"`
-	MemoryMB   uint64            `json:"memory_mb"`
-	Extra      map[string]string `json:"extra,omitempty"`
-	ReceivedAt time.Time         `json:"received_at"`
+	NodeName    string            `json:"node"`
+	IPAddress   string            `json:"ip"`
+	OS          string            `json:"os"`
+	Arch        string            `json:"arch"`
+	CPUCount    int               `json:"cpus"`
+	MemoryBytes uint64            `json:"mem_total_bytes"`
+	Extra       map[string]string `json:"extra,omitempty"`
+	ReceivedAt  time.Time         `json:"received_at"`
 
 	// From node annotations
 	ClusterName string `json:"cluster_name,omitempty"`
@@ -99,6 +112,21 @@ func RunHeartbeatServer(store *HeartbeatStore, addr string, k8sClient ctrl.Clien
 		if err := json.NewDecoder(r.Body).Decode(&hb); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
+		}
+
+		// checkpoint-agent:v1.0.0 always sends node/ip as empty strings (see
+		// the HeartbeatPayload doc comment) - fall back to the TCP peer
+		// address so NodeHealth still gets a usable, stable identity instead
+		// of failing to upsert with "name or generateName is required".
+		if hb.NodeName == "" {
+			if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+				hb.NodeName = host
+			} else {
+				hb.NodeName = r.RemoteAddr
+			}
+		}
+		if hb.IPAddress == "" {
+			hb.IPAddress = hb.NodeName
 		}
 
 		// update store
@@ -170,7 +198,7 @@ func UpsertNodeHealth(ctx context.Context, c ctrl.Client, namespace string, hb H
 				OS:        hb.OS,
 				Arch:      hb.Arch,
 				CPUs:      hb.CPUCount,
-				MemTotal:  hb.MemoryMB,
+				MemTotal:  hb.MemoryBytes,
 				LastSeen:  metav1.NewTime(hb.ReceivedAt),
 				Condition: condition,
 			},
@@ -183,7 +211,7 @@ func UpsertNodeHealth(ctx context.Context, c ctrl.Client, namespace string, hb H
 	nh.Status.OS = hb.OS
 	nh.Status.Arch = hb.Arch
 	nh.Status.CPUs = hb.CPUCount
-	nh.Status.MemTotal = hb.MemoryMB
+	nh.Status.MemTotal = hb.MemoryBytes
 	nh.Status.LastSeen = metav1.NewTime(hb.ReceivedAt)
 	nh.Status.Condition = condition
 

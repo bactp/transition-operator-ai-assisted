@@ -1,0 +1,30 @@
+# MCPServer CR (kmcp-owned CRD, kagent.dev/v1alpha1) for failover-agent-mcp.
+#
+# Field shape verified against a real working MCPServer already running in
+# this cluster (kubectl get mcpserver skill-manager -n kagent -o yaml):
+# spec.httpTransport.{path,targetPort} (not spec.http), spec.deployment.port,
+# spec.transportType. imagePullPolicy: Never + nodeSelector mirrors how
+# skill-manager-mcp is run here - no image registry exists in this cluster,
+# so images are built/loaded directly onto sre-control instead.
+apiVersion: kagent.dev/v1alpha1
+kind: MCPServer
+metadata:
+  name: failover-agent-mcp
+  namespace: kagent
+spec:
+  transportType: http
+  httpTransport:
+    path: /mcp
+    targetPort: 8080
+  timeout: 30s
+  deployment:
+    image: docker.io/library/failover-agent-mcp:demo
+    imagePullPolicy: Never
+    port: 8080
+    serviceAccountName: failover-agent-mcp
+    nodeSelector:
+      kubernetes.io/hostname: sre-control
+    tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule

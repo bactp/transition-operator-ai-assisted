@@ -30,6 +30,21 @@ spec:
         control-plane: controller-manager
         app.kubernetes.io/name: transition-operator
     spec:
+      # Pinned to sre-control (192.168.28.158) - this must match the IP
+      # hardcoded in checkpoint-agent's CONTROLLER_URL and the mgmt-cluster
+      # apiserver endpoint. Combined with metrics_service.yaml's
+      # externalTrafficPolicy: Local, this keeps heartbeat traffic on a single
+      # node so kube-proxy/Cilium never SNATs it to an internal pod-CIDR
+      # address before the operator sees it - otherwise RemoteAddr comes
+      # through as a 10.0.0.0/8 Cilium address instead of the real workload
+      # cluster node IP (verified empirically: pod landed on sre-worker01
+      # while traffic targeted sre-control, and heartbeat.NodeName ended up
+      # as an internal 10.0.0.x address instead of the real 192.168.28.110).
+      nodeSelector:
+        kubernetes.io/hostname: sre-control
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
       # TODO(user): Uncomment the following code to configure the nodeAffinity expression
       # according to the platforms which are supported by your solution.
       # It is considered best practice to support multiple architectures. You can
@@ -51,12 +66,19 @@ spec:
       #             values:
       #               - linux
       securityContext:
-        # Projects are configured by default to adhere to the "restricted" Pod Security Standards.
-        # This ensures that deployments meet the highest security requirements for Kubernetes.
-        # For more details, see: https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted
-        runAsNonRoot: true
-        seccompProfile:
-          type: RuntimeDefault
+        # NOT the "restricted" Pod Security Standards default anymore.
+        # Rootless buildah (from/add/commit) needs unshare(CLONE_NEWUSER),
+        # CAP_SYS_CHROOT, and a remount(MS_PRIVATE) of "/" during layer
+        # apply. Verified directly on this cluster (throwaway Jobs on
+        # sre-control, same image): RuntimeDefault seccomp blocks the
+        # unshare unconditionally even for root; switching to Unconfined
+        # plus individually-added capabilities (SETUID/SETGID/SYS_ADMIN)
+        # still failed the remount step with "permission denied" - that's
+        # containerd/runc's mount-propagation setup for unprivileged
+        # containers, not something any single capability grants back.
+        # Only privileged: true (below) got a clean run. Acceptable here:
+        # this is a single-tenant mgmt-cluster, not a shared/multi-tenant one.
+        runAsNonRoot: false
       containers:
       - command:
         - /manager
@@ -65,12 +87,113 @@ spec:
           - --health-probe-bind-address=:8081
         image: controller:latest
         name: manager
-        ports: []
+        imagePullPolicy: Always
+
+        env:
+        # MinIO
+        - name: MINIO_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              name: minio-secret
+              key: MINIO_ENDPOINT
+
+        - name: MINIO_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: minio-secret
+              key: MINIO_ACCESS_KEY
+
+        - name: MINIO_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: minio-secret
+              key: MINIO_SECRET_KEY
+
+        - name: MINIO_BUCKET
+          valueFrom:
+            secretKeyRef:
+              name: minio-secret
+              key: MINIO_BUCKET
+
+        # Registry
+        - name: REPOSITORY
+          valueFrom:
+            secretKeyRef:
+              name: reg-credentials
+              key: username
+
+        - name: REGISTRY_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: reg-credentials
+              key: password
+
+        - name: REGISTRY_URL
+          valueFrom:
+            secretKeyRef:
+              name: reg-credentials
+              key: registry
+
+        # Registry secret refs
+        - name: SECRET_NAME_REF
+          value: "reg-credentials"
+
+        - name: SECRET_NAMESPACE_REF
+          value: "default"
+
+        # Git
+        - name: GIT_SERVER_URL
+          valueFrom:
+            secretKeyRef:
+              name: git-secret
+              key: GIT_SERVER_URL
+
+        - name: GIT_SECRET_NAME
+          valueFrom:
+            secretKeyRef:
+              name: git-secret
+              key: GIT_SECRET_NAME
+
+        - name: GIT_SECRET_NAMESPACE
+          valueFrom:
+            secretKeyRef:
+              name: git-secret
+              key: GIT_SECRET_NAMESPACE
+
+        # Heartbeat
+        - name: HEARTBEAT_FAULT_DELAY
+          value: "15"
+
+        # Namespace
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+
+        # AI-assisted failover approval (kagent) - unset KAGENT_AGENT_NAME to
+        # disable and fall back to fully-automatic behavior.
+        - name: KAGENT_AGENT_NAME
+          value: "failover-agent"
+        - name: KAGENT_AGENT_NAMESPACE
+          value: "kagent"
+        - name: KAGENT_URL
+          value: "http://kagent-controller.kagent.svc.cluster.local:8083"
+
+        ports:
+        - containerPort: 8443
+          name: https
+          protocol: TCP
+
+        - containerPort: 8090
+          name: heartbeat
+          protocol: TCP
         securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - "ALL"
+          # See the pod-level securityContext comment above - granular
+          # capabilities (SETUID/SETGID/SYS_ADMIN/SYS_CHROOT) were tried and
+          # verified insufficient on this cluster's containerd/runc; only
+          # privileged got a clean buildah from/add/commit run.
+          privileged: true
+          runAsUser: 0
         livenessProbe:
           httpGet:
             path: /healthz

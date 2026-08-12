@@ -1,0 +1,22 @@
+name: failover-agent-mcp
+framework: mcp-go
+version: 0.1.0
+description: MCP tools exposing bounded read/propose operations over transition-operator's ClusterPolicy/Checkpoint CRDs for the failover-agent kagent Agent
+author: transition-operator
+secrets:
+    local:
+        enabled: false
+        provider: env
+        file: .env.local
+    production:
+        enabled: false
+        provider: kubernetes
+        secretName: failover-agent-mcp-secrets-production
+        namespace: default
+    staging:
+        enabled: false
+        provider: kubernetes
+        secretName: failover-agent-mcp-secrets-staging
+        namespace: default
+created_at: 2026-08-10T08:23:38.545541935Z
+updated_at: 2026-08-10T08:23:46.943530576Z

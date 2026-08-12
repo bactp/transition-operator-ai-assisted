@@ -19,6 +19,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
 	"sync"
 	"time"
 
@@ -345,7 +347,7 @@ func (r *ClusterPolicyReconciler) handleWorkloadClusterMachine(ctx context.Conte
 
 func (r *ClusterPolicyReconciler) TransitionAllWorkloads(ctx context.Context, clusterClient resource.APIPatchingApplicator, clusterPolicy *transitionv1.ClusterPolicy, req ctrl.Request) {
 	log := logf.FromContext(ctx)
-	log.Info("Transitioning all workloads", clusterPolicy.Name)
+	log.Info("Transitioning all workloads", "clusterPolicy", clusterPolicy.Name)
 	//transition all workloads in the cluster
 
 }
@@ -396,7 +398,7 @@ func (r *ClusterPolicyReconciler) TransitionSelectedWorkloads(ctx context.Contex
 		}
 	}
 	if drRepo == nil {
-		log.Info("Repository named 'dr' not found; using last repository as fallback, skipping transition", clusterPolicy.Name)
+		log.Info("Repository named 'dr' not found; using last repository as fallback, skipping transition", "clusterPolicy", clusterPolicy.Name)
 		// drRepo = repos[len(repos)-1]
 		return
 	}
@@ -626,6 +628,21 @@ func (r *ClusterPolicyReconciler) HandlePodsOnNodeForPolicy(
 	req ctrl.Request,
 	log logr.Logger,
 ) {
+	if !canAutoTransition(clusterPolicy) {
+		log.Info("ai-assisted mode: pod transition blocked pending approval", "node", node.Name, "clusterPolicy", clusterPolicy.Name, "phase", clusterPolicy.Status.Phase)
+		// Only ask the agent while no recommendation cycle is active yet
+		// (Phase==""). Once it has answered - AwaitingApproval (proposed) or
+		// Rejected (declined) - re-invoking it every ~30s while a human is
+		// still reviewing wastes an LLM round-trip for no new information;
+		// propose_failover would just reply "already X, not overwriting"
+		// anyway. Phase resets to "" on the NEXT distinct fault episode
+		// (fresh Checkpoint state), so this still re-asks when warranted.
+		if clusterPolicy.Status.Phase == "" {
+			r.notifyAgentOfFaultOnce(ctx, clusterPolicy, fmt.Sprintf("node %s not ready, workloads pending transition", node.Name))
+		}
+		return
+	}
+
 	var (
 		processed = make(map[string]struct{}) // To avoid duplicate transitions
 		mu        sync.Mutex
@@ -1015,6 +1032,17 @@ func (r *ClusterPolicyReconciler) triggerMigrationNodeCP(ctx context.Context, cl
 	}
 	// log.Info("Found ClusterPolicy for cluster true true", "clusterPolicy", clusterPolicy.Name, "cluster", clusterName)
 
+	if !canAutoTransition(clusterPolicy) {
+		log.Info("ai-assisted mode: migration blocked pending approval", "cluster", clusterName, "phase", clusterPolicy.Status.Phase)
+		// See the matching comment in HandlePodsOnNodeForPolicy - only ask
+		// the agent once per fault episode (Phase==""), not every retry tick
+		// while waiting on human approval.
+		if clusterPolicy.Status.Phase == "" {
+			r.notifyAgentOfFaultOnce(ctx, clusterPolicy, migrationType)
+		}
+		return nil
+	}
+
 	// iterate through all package selectors and check if its a live package
 	for _, pkg := range clusterPolicy.Spec.PackageSelectors {
 
@@ -1194,11 +1222,19 @@ func (r *ClusterPolicyReconciler) StartWorkloadClusterControlPlaneHealthMonitor(
 						"DetectionTime", detectionTime.String(),
 						"T_recoveryStart", state.TDetected.Format("15:04:05.000"),
 					)
+				}
 
-					// log.Info("Control plane status: "+string(status), "cluster", clusterName)
-
-					// if status != controlplane.ControlPlaneReady {
-
+				// Retried every tick, not just on the first detection: in
+				// ai-assisted mode canAutoTransition blocks the first call
+				// (only logging + notifying the agent) but returns nil either
+				// way, so IsTriggered latches true regardless of whether the
+				// migration actually ran. Without this, once approved while
+				// the same fault episode is still ongoing, nothing would ever
+				// retry triggerMigrationNodeCP - it already "used its shot"
+				// while blocked. isClusterPolicyStatusEmpty flips false once a
+				// transition actually succeeds, which naturally stops this
+				// from retrying forever.
+				if state.MissCount > 2 {
 					var refreshedPolicy transitionv1.ClusterPolicy
 					if err := r.Client.Get(ctx, types.NamespacedName{
 						Name:      clusterPolicy.Name,
@@ -1209,8 +1245,6 @@ func (r *ClusterPolicyReconciler) StartWorkloadClusterControlPlaneHealthMonitor(
 					}
 
 					if isClusterPolicyStatusEmpty(refreshedPolicy.Status) {
-
-						log.Info("Triggering migration reconciliation due to control plane issue", "cluster", clusterName)
 						if err := r.triggerMigrationNodeCP(ctx, clusterName, "control-plane unhealthy or fault"); err != nil {
 							log.Error(err, "Failed to trigger migration")
 						}
@@ -1347,8 +1381,11 @@ func (r *ClusterPolicyReconciler) StartWorkloadClusterCNIHealthMonitor(
 						"DetectionTime", detectionTime.String(),
 						"T_recoveryStart", now.Format("15:04:05.000"),
 					)
+				}
 
-					// --- Refresh ClusterPolicy and trigger migration if needed ---
+				// Retried every tick, not just on first detection - see the
+				// matching comment in StartWorkloadClusterControlPlaneHealthMonitor.
+				if silence > timeoutWindow {
 					var refreshedPolicy transitionv1.ClusterPolicy
 					if err := r.Client.Get(ctx, types.NamespacedName{
 						Name:      clusterPolicy.Name,
@@ -1359,7 +1396,6 @@ func (r *ClusterPolicyReconciler) StartWorkloadClusterCNIHealthMonitor(
 					}
 
 					if isClusterPolicyStatusEmpty(refreshedPolicy.Status) {
-						log.Info("Triggering migration reconciliation due to CNI issue", "cluster", clusterName)
 						r.triggerMigrationNodeCP(ctx, clusterName, "CNI unhealthy or fault")
 					}
 				}
@@ -1448,6 +1484,108 @@ func (r *ClusterPolicyReconciler) ensureNetTestPodsOnce(ctx context.Context, clu
 func isClusterPolicyStatusEmpty(status transitionv1.ClusterPolicyStatus) bool {
 
 	return len(status.TransitionedPackages) == 0
+}
+
+const (
+	// ApprovalModeAnnotation opts a ClusterPolicy into the AI-assisted approval
+	// workflow: detected faults are reported to the failover-agent kagent Agent
+	// instead of being transitioned automatically. Absent (or any value other
+	// than ApprovalModeAIAssisted) preserves today's fully-automatic behavior.
+	ApprovalModeAnnotation = "transition.dcnlab.ssu.ac.kr/approval-mode"
+	ApprovalModeAIAssisted = "ai-assisted"
+
+	// agentNotifyCooldown bounds how often notifyAgentOfFault fires for the same
+	// ClusterPolicy while it sits in a blocked phase, so the 5s Reconcile loop
+	// and the health-monitor ticks don't spam the agent with repeat requests.
+	agentNotifyCooldown = 30 * time.Second
+)
+
+var (
+	agentNotifyLast   = make(map[string]time.Time)
+	agentNotifyLastMu sync.Mutex
+)
+
+// canAutoTransition reports whether the reconciler is allowed to execute a
+// transition for cp right now. ClusterPolicy objects not opted into ai-assisted
+// mode always return true - today's automatic behavior, unchanged. Opted-in
+// policies only return true once a human has moved Phase to Approved (or later).
+func canAutoTransition(cp *transitionv1.ClusterPolicy) bool {
+	if cp.Annotations[ApprovalModeAnnotation] != ApprovalModeAIAssisted {
+		return true
+	}
+	switch cp.Status.Phase {
+	case transitionv1.PhaseApproved, transitionv1.PhaseExecuting, transitionv1.PhaseCompleted:
+		return true
+	default: // "", Recommended, AwaitingApproval, Rejected
+		return false
+	}
+}
+
+// notifyAgentOfFaultOnce is the cooldown-guarded entrypoint the reconciler's
+// fault-detection paths call. It fires notifyAgentOfFault asynchronously so a
+// slow/unavailable agent never blocks the Reconcile loop.
+func (r *ClusterPolicyReconciler) notifyAgentOfFaultOnce(ctx context.Context, cp *transitionv1.ClusterPolicy, faultType string) {
+	agentNotifyLastMu.Lock()
+	last, seen := agentNotifyLast[cp.Name]
+	if seen && time.Since(last) < agentNotifyCooldown {
+		agentNotifyLastMu.Unlock()
+		return
+	}
+	agentNotifyLast[cp.Name] = time.Now()
+	agentNotifyLastMu.Unlock()
+
+	go r.notifyAgentOfFault(cp, faultType)
+}
+
+// notifyAgentOfFault asks the failover-agent kagent Agent to reason about a
+// detected fault and, if warranted, call the propose_failover MCP tool.
+//
+// It shells out to the `kagent invoke` CLI rather than hand-rolling kagent's
+// A2A HTTP envelope: this is the exact same command a human operator would run
+// against the agent, it is already verified to work against a live kagent
+// installation, and it keeps this controller decoupled from kagent's wire
+// format. The `kagent` binary must be present in the operator's container image
+// and KAGENT_AGENT_NAME/KAGENT_AGENT_NAMESPACE/KAGENT_URL must be set on the
+// manager Deployment - if KAGENT_AGENT_NAME is unset this is a no-op so
+// clusters not wired up for the demo are unaffected.
+//
+// Uses a background context (not the caller's Reconcile-scoped ctx) because it
+// runs in its own goroutine and must survive past the Reconcile call that
+// triggered it - the LLM round-trip routinely takes several seconds.
+func (r *ClusterPolicyReconciler) notifyAgentOfFault(cp *transitionv1.ClusterPolicy, faultType string) {
+	log := logf.Log.WithName("clusterpolicy-agent-notify")
+
+	agentName := os.Getenv("KAGENT_AGENT_NAME")
+	if agentName == "" {
+		log.Info("KAGENT_AGENT_NAME not set; skipping agent notification", "clusterPolicy", cp.Name)
+		return
+	}
+	agentNS := os.Getenv("KAGENT_AGENT_NAMESPACE")
+	if agentNS == "" {
+		agentNS = "kagent"
+	}
+	kagentURL := os.Getenv("KAGENT_URL") // e.g. http://kagent-controller.kagent.svc.cluster.local:8083
+
+	prompt := fmt.Sprintf(
+		"Fault detected on cluster %q (ClusterPolicy %q, namespace %q): %s. "+
+			"Use your tools to confirm cluster and checkpoint health and review the "+
+			"transition candidates, then call propose_failover if a failover is warranted.",
+		cp.Spec.ClusterSelector.Name, cp.Name, cp.Namespace, faultType)
+
+	args := []string{"invoke", "--agent", agentName, "--task", prompt, "-n", agentNS, "-o", "json"}
+	if kagentURL != "" {
+		args = append(args, "--kagent-url", kagentURL)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, "kagent", args...).CombinedOutput()
+	if err != nil {
+		log.Error(err, "Failed to notify failover-agent of fault", "clusterPolicy", cp.Name, "output", string(out))
+		return
+	}
+	log.Info("Notified failover-agent of fault", "clusterPolicy", cp.Name, "faultType", faultType, "response", string(out))
 }
 
 // SetupWithManager sets up the controller with the Manager.

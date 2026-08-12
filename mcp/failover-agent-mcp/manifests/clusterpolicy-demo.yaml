@@ -1,0 +1,30 @@
+# Demo ClusterPolicy for the failover-agent phase-1 walkthrough. Source cluster
+# is the one real CAPI cluster in this environment (sre-test1); the target is
+# a placeholder name (no second CAPI cluster has been provisioned yet - per
+# the demo owner's call to defer that). get_cluster_health/get_checkpoint_status
+# work against real objects; get_transition_candidates/propose_failover will
+# report the placeholder target as unhealthy/unreachable, which is itself a
+# valid, honest demo of the agent reasoning about candidate health.
+apiVersion: transition.dcnlab.ssu.ac.kr/v1
+kind: ClusterPolicy
+metadata:
+  name: failover-agent-demo
+  namespace: default
+  annotations:
+    transition.dcnlab.ssu.ac.kr/approval-mode: ai-assisted
+spec:
+  clusterSelector:
+    name: sre-test1
+    repo: http://gitea.gitea.svc.cluster.local:3000/nephio/sre-test1.git
+    repoType: git
+  packageSelectors:
+    - name: demo-workload
+      packagePath: demo-workload
+      packageType: Stateless
+      liveStatePackage: false
+      backupInformation: []
+  targetClusterPolicy:
+    preferClusters:
+      - name: sre-target-placeholder
+        repoType: git
+        weight: 100

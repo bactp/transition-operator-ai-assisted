@@ -18,6 +18,13 @@ resources:
 - ../crd
 - ../rbac
 - ../manager
+# NOTE: ../secrets is intentionally NOT included here. Its resources need to
+# live in different namespaces (transition-operator-system vs default), and
+# kustomize's top-level `namespace:` transformer above unconditionally
+# overwrites any namespace already set on a resource - verified empirically:
+# it moved git-user-secret from `default` into transition-operator-system and
+# renamed it, breaking the operator's GIT_SECRET_NAMESPACE=default lookup.
+# Apply config/secrets/*.yaml directly with `kubectl apply -f` instead.
 # [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix including the one in
 # crd/kustomization.yaml
 #- ../webhook

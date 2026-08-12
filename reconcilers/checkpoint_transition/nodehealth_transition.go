@@ -199,7 +199,7 @@ func TransitionOnMissedNodeHealth(
 		}
 	}
 	if drRepo == nil {
-		log.Info("Repository named 'dr' not found; skipping transition", clusterPolicy.Name)
+		log.Info("Repository named 'dr' not found; skipping transition", "clusterPolicy", clusterPolicy.Name)
 		return
 	}
 
